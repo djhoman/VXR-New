@@ -1,8 +1,10 @@
 export const config = { runtime: "edge" };
 
-const TARGET_BASE = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
+// Clean base target (remove trailing slash)
+const TARGET_ROOT = (process.env.TARGET_DOMAIN || "").replace(/\/$/, "");
 
-const STRIP_HEADERS = new Set([
+// Headers that must be stripped out
+const HOP_BY_HOP_HEADERS = new Set([
   "host",
   "connection",
   "keep-alive",
@@ -18,45 +20,84 @@ const STRIP_HEADERS = new Set([
   "x-forwarded-port",
 ]);
 
-export default async function handler(req) {
-  if (!TARGET_BASE) {
-    return new Response("Misconfigured: TARGET_DOMAIN is not set", { status: 500 });
+/**
+ * Build destination URL using native URL parser
+ * More reliable than manual string slicing
+ */
+function resolveDestination(inputUrl) {
+  const parsed = new URL(inputUrl);
+  return TARGET_ROOT + parsed.pathname + parsed.search;
+}
+
+/**
+ * Clone headers while filtering unwanted ones
+ * Also reconstruct client IP forwarding
+ */
+function transformHeaders(sourceHeaders) {
+  const nextHeaders = new Headers();
+  let clientAddress = null;
+
+  for (const [name, value] of sourceHeaders) {
+    if (HOP_BY_HOP_HEADERS.has(name) || name.startsWith("x-vercel-")) {
+      continue;
+    }
+
+    // Capture IP info
+    if (name === "x-real-ip") {
+      clientAddress = value;
+      continue;
+    }
+
+    if (name === "x-forwarded-for") {
+      clientAddress ||= value;
+      continue;
+    }
+
+    nextHeaders.set(name, value);
+  }
+
+  // Reapply IP if detected
+  if (clientAddress) {
+    nextHeaders.set("x-forwarded-for", clientAddress);
+  }
+
+  return nextHeaders;
+}
+
+/**
+ * Check if HTTP method supports body
+ */
+const hasPayload = (method) =>
+  method !== "GET" && method !== "HEAD";
+
+/**
+ * Main handler
+ */
+export default async function edgeGateway(req) {
+  if (!TARGET_ROOT) {
+    return new Response("Misconfigured: TARGET_DOMAIN is not set", {
+      status: 500,
+    });
   }
 
   try {
-    const pathStart = req.url.indexOf("/", 8);
-    const targetUrl =
-      pathStart === -1 ? TARGET_BASE + "/" : TARGET_BASE + req.url.slice(pathStart);
-
-    const out = new Headers();
-    let clientIp = null;
-    for (const [k, v] of req.headers) {
-      if (STRIP_HEADERS.has(k)) continue;
-      if (k.startsWith("x-vercel-")) continue;
-      if (k === "x-real-ip") {
-        clientIp = v;
-        continue;
-      }
-      if (k === "x-forwarded-for") {
-        if (!clientIp) clientIp = v;
-        continue;
-      }
-      out.set(k, v);
-    }
-    if (clientIp) out.set("x-forwarded-for", clientIp);
-
+    const destination = resolveDestination(req.url);
+    const preparedHeaders = transformHeaders(req.headers);
     const method = req.method;
-    const hasBody = method !== "GET" && method !== "HEAD";
 
-    return await fetch(targetUrl, {
+    return await fetch(destination, {
       method,
-      headers: out,
-      body: hasBody ? req.body : undefined,
+      headers: preparedHeaders,
+      body: hasPayload(method) ? req.body : undefined,
       duplex: "half",
       redirect: "manual",
     });
   } catch (err) {
+    // Minimal but useful logging
     console.error("relay error:", err);
-    return new Response("Bad Gateway: Tunnel Failed", { status: 502 });
+
+    return new Response("Bad Gateway: Tunnel Failed", {
+      status: 502,
+    });
   }
 }
